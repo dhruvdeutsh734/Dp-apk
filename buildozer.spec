@@ -5,7 +5,8 @@ package.domain = org.yourcompany
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 version = 1.0
-requirements = python3,kivy==2.3.0,requests,openpyxl,certifi,urllib3,charset_normalizer,idna
+[app]
+requirements=python3==3.12,kivy==2.3.0,requests,openpyxl,certifi,urllib3,charset_normalizer,idna
 orientation = portrait
 fullscreen = 0
 
