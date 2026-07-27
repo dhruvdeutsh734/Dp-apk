@@ -6,7 +6,7 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 version = 1.0
 android.ndk = 25b
-requirements = python3==3.11.8,hostpython3==3.11.8,kivy==2.3.0,requests,openpyxl,certifi,urllib3,charset_normalizer,idna
+requirements = python3==3.11.8,hostpython3==3.11.8,kivy==2.3.0,requests,openpyxl,plyer,certifi,urllib3,charset_normalizer,idna
 orientation = portrait
 fullscreen = 0
 
