@@ -6,14 +6,28 @@ from datetime import datetime, timezone
 
 import requests
 from kivy.app import App
+from kivy.core.window import Window
+from kivy.graphics import Color, RoundedRectangle
 from kivy.uix.screenmanager import ScreenManager, Screen
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.uix.textinput import TextInput
 from kivy.uix.button import Button
-from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.scrollview import ScrollView
 from kivy.clock import Clock
+
+try:
+    from plyer import filechooser
+except ImportError:
+    filechooser = None
+
+# App color palette — change these 4 lines to re-theme the whole app
+BG_COLOR = (0.09, 0.11, 0.15, 1)
+CARD_COLOR = (0.14, 0.16, 0.20, 1)
+ACCENT_COLOR = (0.20, 0.55, 0.95, 1)
+TEXT_COLOR = (0.92, 0.92, 0.94, 1)
+
+Window.clearcolor = BG_COLOR
 
 try:
     import openpyxl
@@ -204,18 +218,51 @@ def send_packets(packets, ip, port, log):
 
 
 # ───────────────────────────────────────────
+#  SMALL UI HELPERS
+# ───────────────────────────────────────────
+
+class StyledButton(Button):
+    """A Button with rounded corners and our accent color instead of Kivy's default grey box."""
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.background_normal = ""
+        self.background_down = ""
+        self.background_color = (0, 0, 0, 0)  # hide default flat background
+        self.color = (1, 1, 1, 1)
+        self.font_size = 16
+        self.bold = True
+        with self.canvas.before:
+            Color(*ACCENT_COLOR)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[10])
+        self.bind(pos=self._update_rect, size=self._update_rect)
+
+    def _update_rect(self, *_):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+
+
+def styled_label(**kw):
+    kw.setdefault("color", TEXT_COLOR)
+    return Label(**kw)
+
+
+# ───────────────────────────────────────────
 #  UI SCREENS
 # ───────────────────────────────────────────
 
 class LoginScreen(Screen):
     def __init__(self, **kw):
         super().__init__(**kw)
-        layout = BoxLayout(orientation="vertical", padding=30, spacing=15)
-        layout.add_widget(Label(text="AIS-140 Sender — Login", font_size=22, size_hint_y=0.2))
-        self.email = TextInput(hint_text="Email", multiline=False, size_hint_y=0.15)
-        self.password = TextInput(hint_text="Password", password=True, multiline=False, size_hint_y=0.15)
-        self.status = Label(text="", size_hint_y=0.15)
-        btn = Button(text="Login", size_hint_y=0.15)
+        layout = BoxLayout(orientation="vertical", padding=30, spacing=18)
+        layout.add_widget(styled_label(text="AIS-140 Sender", font_size=26, bold=True, size_hint_y=0.25))
+        self.email = TextInput(hint_text="Email", multiline=False, size_hint_y=0.09,
+                                background_color=CARD_COLOR, foreground_color=TEXT_COLOR,
+                                cursor_color=TEXT_COLOR, padding=[15, 15, 15, 15])
+        self.password = TextInput(hint_text="Password", password=True, multiline=False, size_hint_y=0.09,
+                                   background_color=CARD_COLOR, foreground_color=TEXT_COLOR,
+                                   cursor_color=TEXT_COLOR, padding=[15, 15, 15, 15])
+        self.status = styled_label(text="", size_hint_y=0.1, color=(0.9, 0.4, 0.4, 1))
+        btn = StyledButton(text="Login", size_hint_y=0.12)
         btn.bind(on_press=self.do_login)
         layout.add_widget(self.email)
         layout.add_widget(self.password)
@@ -247,24 +294,26 @@ class MainScreen(Screen):
     def __init__(self, **kw):
         super().__init__(**kw)
         self.devices = []
-        root = BoxLayout(orientation="vertical", padding=10, spacing=8)
+        self.selected_path = None
+        root = BoxLayout(orientation="vertical", padding=15, spacing=12)
 
-        self.token_label = Label(text="Tokens: -", size_hint_y=0.06)
+        self.token_label = styled_label(text="Tokens: -", font_size=16, bold=True, size_hint_y=0.06)
         root.add_widget(self.token_label)
 
-        self.chooser = FileChooserListView(filters=["*.xlsx"], size_hint_y=0.4)
-        root.add_widget(self.chooser)
+        self.file_label = styled_label(text="No file selected", size_hint_y=0.08,
+                                        color=(0.7, 0.7, 0.75, 1))
+        root.add_widget(self.file_label)
 
-        load_btn = Button(text="Load Excel", size_hint_y=0.08)
-        load_btn.bind(on_press=self.load_excel)
-        root.add_widget(load_btn)
+        pick_btn = StyledButton(text="Select Excel File", size_hint_y=0.09)
+        pick_btn.bind(on_press=self.pick_excel)
+        root.add_widget(pick_btn)
 
-        self.send_btn = Button(text="Send All Devices", size_hint_y=0.08)
+        self.send_btn = StyledButton(text="Send All Devices", size_hint_y=0.09)
         self.send_btn.bind(on_press=self.send_all)
         root.add_widget(self.send_btn)
 
-        scroll = ScrollView(size_hint_y=0.38)
-        self.log_label = Label(text="", size_hint_y=None, halign="left", valign="top")
+        scroll = ScrollView(size_hint_y=0.68)
+        self.log_label = styled_label(text="", size_hint_y=None, halign="left", valign="top")
         self.log_label.bind(texture_size=lambda *_: setattr(self.log_label, "height", self.log_label.texture_size[1]))
         self.log_label.text_size = (self.log_label.width, None)
         scroll.add_widget(self.log_label)
@@ -280,16 +329,33 @@ class MainScreen(Screen):
             self.log_label.text += msg + "\n"
         Clock.schedule_once(_upd)
 
-    def load_excel(self, *_):
-        if not self.chooser.selection:
-            self.log("❌ Select an .xlsx file first.")
+    def pick_excel(self, *_):
+        """Opens Android's own system file picker instead of drawing our own file browser.
+        This needs no storage permission at all — Android hands us the file directly."""
+        if filechooser is None:
+            self.log("❌ plyer not installed — add 'plyer' to buildozer.spec requirements.")
             return
-        path = self.chooser.selection[0]
-        try:
-            self.devices = read_devices_from_excel(path)
-            self.log(f"✅ Loaded {len(self.devices)} device(s) from {path}")
-        except Exception as e:
-            self.log(f"❌ Failed to read Excel: {e}")
+        filechooser.open_file(
+            on_selection=self._on_file_selected,
+            filters=[("Excel files", "*.xlsx")],
+        )
+
+    def _on_file_selected(self, selection):
+        if not selection:
+            return
+        path = selection[0]
+
+        def _load(dt):
+            self.selected_path = path
+            self.file_label.text = path.split("/")[-1]
+            try:
+                self.devices = read_devices_from_excel(path)
+                self.log(f"✅ Loaded {len(self.devices)} device(s) from {self.file_label.text}")
+            except Exception as e:
+                self.log(f"❌ Failed to read Excel: {e}")
+        # plyer's callback fires on a background thread on some Android versions,
+        # so we hop back onto the main/UI thread before touching any widgets.
+        Clock.schedule_once(_load)
 
     def send_all(self, *_):
         if not self.devices:
