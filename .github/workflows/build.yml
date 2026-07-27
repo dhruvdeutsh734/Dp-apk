@@ -19,6 +19,8 @@ jobs:
           pip install --user buildozer cython
 
       - name: Build APK
+        env:
+          PIP_CONSTRAINT: ${{ github.workspace }}/pip-constraint.txt
         run: |
           export PATH=$PATH:~/.local/bin
           yes | buildozer -v android debug
