@@ -16,7 +16,7 @@ jobs:
 
       - name: Install Buildozer
         run: |
-          pip install --user --break-system-packages buildozer cython
+          pip install --user buildozer cython
 
       - name: Build APK
         run: |
