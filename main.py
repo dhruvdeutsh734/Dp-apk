@@ -17,9 +17,11 @@ from kivy.uix.scrollview import ScrollView
 from kivy.clock import Clock
 
 try:
-    from plyer import filechooser
+    from jnius import autoclass, cast
+    from android import activity as android_activity
+    ANDROID_AVAILABLE = True
 except ImportError:
-    filechooser = None
+    ANDROID_AVAILABLE = False
 
 # App color palette — change these 4 lines to re-theme the whole app
 BG_COLOR = (0.09, 0.11, 0.15, 1)
@@ -86,6 +88,86 @@ def decrement_token(uid, id_token, current_value):
     requests.patch(url, headers={"Authorization": f"Bearer {id_token}"},
                     json={"fields": {"tokens": {"integerValue": new_val}}}, timeout=15)
     return new_val
+
+
+# ───────────────────────────────────────────
+#  ANDROID FILE PICKER (direct Intent + ContentResolver, no plyer)
+#  Modern Android hands back a content:// reference, not a plain file
+#  path — we copy its bytes into our own app storage so openpyxl can
+#  open it like a normal file.
+# ───────────────────────────────────────────
+
+PICK_FILE_REQUEST_CODE = 4269
+
+
+def android_pick_file(callback):
+    """callback(local_filepath_or_None, error_or_None) fires once the user picks a file or cancels."""
+    if not ANDROID_AVAILABLE:
+        callback(None, "Android file access isn't available on this build.")
+        return
+
+    PythonActivity = autoclass('org.kivy.android.PythonActivity')
+    Intent = autoclass('android.content.Intent')
+    Activity = autoclass('android.app.Activity')
+    current_activity = cast('android.app.Activity', PythonActivity.mActivity)
+
+    def on_activity_result(request_code, result_code, intent):
+        if request_code != PICK_FILE_REQUEST_CODE:
+            return
+        android_activity.unbind(on_activity_result=on_activity_result)
+
+        if result_code != Activity.RESULT_OK or intent is None:
+            callback(None, None)  # user cancelled — not an error
+            return
+
+        try:
+            uri = intent.getData()
+            local_path = _copy_uri_to_local_file(current_activity, uri)
+            callback(local_path, None)
+        except Exception as e:
+            callback(None, f"Could not read the picked file: {e}")
+
+    android_activity.bind(on_activity_result=on_activity_result)
+
+    intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+    intent.addCategory(Intent.CATEGORY_OPENABLE)
+    intent.setType("*/*")
+    current_activity.startActivityForResult(intent, PICK_FILE_REQUEST_CODE)
+
+
+def _copy_uri_to_local_file(current_activity, uri):
+    """Copies the bytes behind a content:// URI into our app's private cache
+    folder and returns a normal filesystem path openpyxl can open."""
+    OpenableColumns = autoclass('android.provider.OpenableColumns')
+
+    resolver = current_activity.getContentResolver()
+
+    display_name = "picked_file.xlsx"
+    try:
+        cursor = resolver.query(uri, None, None, None, None)
+        if cursor is not None:
+            cursor.moveToFirst()
+            name_index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if name_index != -1:
+                display_name = cursor.getString(name_index) or display_name
+            cursor.close()
+    except Exception:
+        pass  # non-fatal — we'll just use the fallback name above
+
+    cache_dir = current_activity.getCacheDir().getAbsolutePath()
+    local_path = f"{cache_dir}/{display_name}"
+
+    input_stream = resolver.openInputStream(uri)
+    with open(local_path, "wb") as out_file:
+        buffer = bytearray(4096)
+        while True:
+            n = input_stream.read(buffer)
+            if n == -1:
+                break
+            out_file.write(bytes(buffer[:n]))
+    input_stream.close()
+
+    return local_path
 
 
 # ───────────────────────────────────────────
@@ -332,33 +414,31 @@ class MainScreen(Screen):
     def pick_excel(self, *_):
         """Opens Android's own system file picker instead of drawing our own file browser.
         This needs no storage permission at all — Android hands us the file directly."""
-        if filechooser is None:
-            self.log("❌ plyer not installed — add 'plyer' to buildozer.spec requirements.")
-            return
         try:
-            filechooser.open_file(on_selection=self._on_file_selected)
+            android_pick_file(self._on_file_picked)
         except Exception as e:
             self.log(f"❌ Could not open file picker: {e}")
 
-    def _on_file_selected(self, selection):
-        if not selection or not selection[0]:
-            self.log("❌ No file was selected (picker returned nothing usable).")
-            return
-        path = selection[0]
-
+    def _on_file_picked(self, local_path, error):
+        # android_pick_file's callback can fire off the UI thread — hop back on it
+        # before touching any widgets or doing file I/O that updates the UI.
         def _load(dt):
-            if not isinstance(path, str) or not path.lower().endswith(".xlsx"):
-                self.log(f"❌ Please select a .xlsx file (got: {path})")
+            if error:
+                self.log(f"❌ {error}")
                 return
-            self.selected_path = path
-            self.file_label.text = path.split("/")[-1]
+            if not local_path:
+                self.log("ℹ️ No file selected.")
+                return
+            if not local_path.lower().endswith(".xlsx"):
+                self.log(f"❌ Please select a .xlsx file (got: {local_path.split('/')[-1]})")
+                return
+            self.selected_path = local_path
+            self.file_label.text = local_path.split("/")[-1]
             try:
-                self.devices = read_devices_from_excel(path)
+                self.devices = read_devices_from_excel(local_path)
                 self.log(f"✅ Loaded {len(self.devices)} device(s) from {self.file_label.text}")
             except Exception as e:
                 self.log(f"❌ Failed to read Excel: {e}")
-        # plyer's callback fires on a background thread on some Android versions,
-        # so we hop back onto the main/UI thread before touching any widgets.
         Clock.schedule_once(_load)
 
     def send_all(self, *_):
