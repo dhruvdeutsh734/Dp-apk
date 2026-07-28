@@ -335,17 +335,21 @@ class MainScreen(Screen):
         if filechooser is None:
             self.log("❌ plyer not installed — add 'plyer' to buildozer.spec requirements.")
             return
-        filechooser.open_file(
-            on_selection=self._on_file_selected,
-            filters=[("Excel files", "*.xlsx")],
-        )
+        try:
+            filechooser.open_file(on_selection=self._on_file_selected)
+        except Exception as e:
+            self.log(f"❌ Could not open file picker: {e}")
 
     def _on_file_selected(self, selection):
-        if not selection:
+        if not selection or not selection[0]:
+            self.log("❌ No file was selected (picker returned nothing usable).")
             return
         path = selection[0]
 
         def _load(dt):
+            if not isinstance(path, str) or not path.lower().endswith(".xlsx"):
+                self.log(f"❌ Please select a .xlsx file (got: {path})")
+                return
             self.selected_path = path
             self.file_label.text = path.split("/")[-1]
             try:
