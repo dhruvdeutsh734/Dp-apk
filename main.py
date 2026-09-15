@@ -1,4 +1,4 @@
-import binascii
+import re
 import socket
 import threading
 import time
@@ -27,6 +27,7 @@ except ImportError:
 BG_COLOR = (0.09, 0.11, 0.15, 1)
 CARD_COLOR = (0.14, 0.16, 0.20, 1)
 ACCENT_COLOR = (0.20, 0.55, 0.95, 1)
+DANGER_COLOR = (0.80, 0.25, 0.25, 1)
 TEXT_COLOR = (0.92, 0.92, 0.94, 1)
 
 Window.clearcolor = BG_COLOR
@@ -37,31 +38,30 @@ except ImportError:
     openpyxl = None
 
 # ══════════════════════════════════════════════════════════
-#  EDIT THESE THREE BEFORE BUILDING
+#  EDIT THESE BEFORE BUILDING
 # ══════════════════════════════════════════════════════════
-FIREBASE_API_KEY  = "AIzaSyATiCDMs5w-RAKZKIB9tIvx27Hb3uruU48"
-FIREBASE_PROJECT  = "up-data-push"
+FIREBASE_API_KEY = "AIzaSyATiCDMs5w-RAKZKIB9tIvx27Hb3uruU48"
+FIREBASE_PROJECT = "up-data-push"
 
-SERVER_IP, SERVER_PORT       = "127.0.0.1", 5001
-EMERGENCY_IP, EMERGENCY_PORT = "127.0.0.1", 5000
+SERVER_IP, SERVER_PORT = "127.0.0.1", 7001
 # ══════════════════════════════════════════════════════════
 
-DELAY_BETWEEN_PACKETS = 1
-DELAY_BETWEEN_DEVICES = 2
-LINE_ENDING = "\r\n"
-BAT_PCT, LOW_BAT, MEM_PCT, RATE_ON, RATE_OFF = 85, 20, 10, 10, 60
-REPLY_NUMBER = "0000"
+INTERVAL_SECONDS = 10     # how often a full round of packets goes out, same knob as the PC script
+SOCKET_TIMEOUT = 15
+RECONNECT_DELAY = 5
 
-BASE_NRM = (
-    "$NRM,WTEX,1.0NTC,NR,01,L,869645080974068,DL01DX3423,1,26072026,080433,"
-    "028.442605,N,077.083178,E,000.0,137.99,06,0256.90,2.00,0.44,airtel,1,1,"
-    "13.3,4.1,0,C,25,404,10,006a,2aea,9805,006a,18,9804,006a,18,7641,006a,18,"
-    "edff,0096,17,0010,00,0.0,0.0,007562,87.026,-,1.0,0,0,"
-    "2G_1_97WG_W_1_2_1_27_0_0_0,B44F0E03*"
+# The raw packet shape from your PC script (NRM Packet Sender). {} placeholders
+# get filled in per device by build_raw_template() below.
+RAW_TEMPLATE = (
+    "$1,PT4G,WEA1.0,NR,01,L,{imei},{vehicle},1,{date},{time},"
+    "{lat},{lat_dir},{lon},{lon_dir},0.0,293.60,0,"
+    "0217.19,0.00,0.00,airtel,1,1,12.800,3.700,0,O,23,404,10,0964,"
+    "0000000,0|0|00,0011,00,001687,0000,*"
 )
 
+
 # ───────────────────────────────────────────
-#  FIREBASE HELPERS (REST API, no SDK needed)
+#  FIREBASE HELPERS (REST API, no SDK needed) — unchanged from your app
 # ───────────────────────────────────────────
 
 def firebase_login(email, password):
@@ -91,10 +91,7 @@ def decrement_token(uid, id_token, current_value):
 
 
 # ───────────────────────────────────────────
-#  ANDROID FILE PICKER (direct Intent + ContentResolver, no plyer)
-#  Modern Android hands back a content:// reference, not a plain file
-#  path — we copy its bytes into our own app storage so openpyxl can
-#  open it like a normal file.
+#  ANDROID FILE PICKER — unchanged from your app
 # ───────────────────────────────────────────
 
 PICK_FILE_REQUEST_CODE = 4269
@@ -136,10 +133,7 @@ def android_pick_file(callback):
 
 
 def _copy_uri_to_local_file(current_activity, uri):
-    """Copies the bytes behind a content:// URI into our app's private cache
-    folder and returns a normal filesystem path openpyxl can open."""
     OpenableColumns = autoclass('android.provider.OpenableColumns')
-
     resolver = current_activity.getContentResolver()
 
     display_name = "picked_file.xlsx"
@@ -152,7 +146,7 @@ def _copy_uri_to_local_file(current_activity, uri):
                 display_name = cursor.getString(name_index) or display_name
             cursor.close()
     except Exception:
-        pass  # non-fatal — we'll just use the fallback name above
+        pass
 
     cache_dir = current_activity.getCacheDir().getAbsolutePath()
     local_path = f"{cache_dir}/{display_name}"
@@ -171,7 +165,8 @@ def _copy_uri_to_local_file(current_activity, uri):
 
 
 # ───────────────────────────────────────────
-#  EXCEL READER (openpyxl, lighter than pandas for APK builds)
+#  EXCEL READER — unchanged, its columns already line up with the new
+#  protocol's fields (imei, vehicle, latitude, lat_dir, longitude, lon_dir)
 # ───────────────────────────────────────────
 
 def read_devices_from_excel(filepath):
@@ -187,11 +182,11 @@ def read_devices_from_excel(filepath):
         return None
 
     i_imei = col("imei")
-    i_veh  = col("vehicle_no", "vehicle_number", "vehicle")
-    i_lat  = col("latitude")
-    i_ld   = col("lat_dir")
-    i_lon  = col("longitude")
-    i_lod  = col("lon_dir")
+    i_veh = col("vehicle_no", "vehicle_number", "vehicle")
+    i_lat = col("latitude")
+    i_ld = col("lat_dir")
+    i_lon = col("longitude")
+    i_lod = col("lon_dir")
 
     if None in (i_imei, i_veh, i_lat, i_ld, i_lon, i_lod):
         raise ValueError(f"Excel missing required columns. Found: {headers}")
@@ -214,89 +209,157 @@ def read_devices_from_excel(filepath):
 
 
 # ───────────────────────────────────────────
-#  CHECKSUMS + PARSER + PACKET GENERATORS  (unchanged from original script)
+#  PROTOCOL — ported from your PC script (NRM Packet Sender), not the old
+#  LGN/HEL/PVT/EPB set. This protocol sends ONE packet type repeatedly,
+#  bumping the date/time and a frame counter each round, with a CRC16/ARC
+#  checksum. See the two fixes called out below.
 # ───────────────────────────────────────────
 
-def crc32_epb(packet):
-    data = packet[:packet.index('*') + 1]
-    return f"{binascii.crc32(data.encode('ascii')) & 0xFFFFFFFF:08X}"
-
-
-def crc16_ibm(data):
+def crc16_arc(data: bytes) -> int:
     crc = 0x0000
-    for b in data.encode('ascii'):
-        crc ^= b
+    for byte in data:
+        crc ^= byte
         for _ in range(8):
             crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
-    return f"{crc & 0xFFFF:04X}"
+    return crc & 0xFFFF
 
 
-def parse_nrm(nrm):
-    nrm = nrm.strip()
-    parts = nrm.split(',')
-    parts[-1] = parts[-1].split('*')[0].strip()
-    return {
-        "raw": nrm, "vendor_id": parts[1], "fw_version": parts[2], "packet_type": parts[3],
-        "alert_id": parts[4], "pkt_status": parts[5], "imei": parts[6], "vehicle_no": parts[7],
-        "gps_fix": parts[8], "date": parts[9], "time": parts[10], "latitude": parts[11],
-        "lat_dir": parts[12], "longitude": parts[13], "lon_dir": parts[14], "speed": parts[15],
-        "heading": parts[16], "satellites": parts[17], "altitude": parts[18], "pdop": parts[19],
-        "hdop": parts[20], "operator": parts[21], "ignition": parts[22], "main_power": parts[23],
-        "main_voltage": parts[24], "bat_voltage": parts[25], "emergency": parts[26],
-        "tamper": parts[27], "gsm_strength": parts[28], "mcc": parts[29], "mnc": parts[30],
-        "lac": parts[31], "cell_id": parts[32], "nmr": ','.join(parts[33:45]),
-        "din_status": parts[45], "dout_status": parts[46], "analog1": parts[47],
-        "analog2": parts[48], "frame_no": parts[49], "odometer": parts[50],
-    }
+def compute_checksum(body_with_trailing_comma: str) -> str:
+    val = crc16_arc(("$" + body_with_trailing_comma).encode("ascii"))
+    return f"{val:04X}"
 
 
-def gen_lgn(f):
-    return f"$LGN,{f['vehicle_no']},{f['imei']},{f['fw_version']},AIS140,{f['latitude']},{f['longitude']}*"
-
-
-def gen_hel(f):
-    din = f['din_status'].zfill(6)
-    return (f"$HEL,{f['vendor_id']},{f['fw_version']},{f['imei']},{BAT_PCT},{LOW_BAT},"
-            f"{MEM_PCT},{RATE_ON},{RATE_OFF},{din},{f['dout_status']}*")
-
-
-def gen_pvt(f):
-    body = (
-        f"$PVT,{f['vendor_id']},{f['fw_version']},{f['packet_type']},{f['alert_id']},{f['pkt_status']},"
-        f"{f['imei']},{f['vehicle_no']},{f['gps_fix']},{f['date']},{f['time']},{f['latitude']},"
-        f"{f['lat_dir']},{f['longitude']},{f['lon_dir']},{f['speed']},{f['heading']},{f['satellites']},"
-        f"{f['altitude']},{f['pdop']},{f['hdop']},{f['operator']},{f['ignition']},{f['main_power']},"
-        f"{f['main_voltage']},{f['bat_voltage']},{f['emergency']},{f['tamper']},{f['gsm_strength']},"
-        f"{f['mcc']},{f['mnc']},{f['lac']},{f['cell_id']},{f['nmr']},{f['din_status']},"
-        f"{f['dout_status']},{f['frame_no']},"
+def build_raw_template(imei, vehicle, lat, lat_dir, lon, lon_dir):
+    now = datetime.now(timezone.utc)
+    return RAW_TEMPLATE.format(
+        imei=imei, vehicle=vehicle,
+        date=now.strftime("%d%m%Y"), time=now.strftime("%H%M%S"),
+        lat=lat, lat_dir=lat_dir, lon=lon, lon_dir=lon_dir,
     )
-    return body + crc16_ibm(body) + "*"
 
 
-def gen_epb(f, pkt_type):
-    gps_fix = 'A' if f['gps_fix'] == '1' else 'V'
-    body = (f"$EPB,{pkt_type},{f['imei']},NM,{f['date']}{f['time']},{gps_fix},{f['latitude']},"
-            f"{f['lat_dir']},{f['longitude']},{f['lon_dir']},{f['altitude']},{f['speed']},"
-            f"{f['odometer']},G,{f['vehicle_no']},{REPLY_NUMBER}*")
-    return body + crc32_epb(body)
+def parse_packet(raw: str, imei: str) -> dict:
+    raw = raw.strip()
+    if raw.startswith("$"):
+        raw = raw[1:]
+    raw = raw.split("*")[0]
+
+    fields = raw.split(",")
+    frame_idx = None
+    for i in range(len(fields) - 1, max(len(fields) - 10, 0), -1):
+        if re.fullmatch(r"\d{4,6}", fields[i]):
+            frame_idx = i
+            break
+
+    if frame_idx is None:
+        raise ValueError(f"[{imei}] Could not locate frame number field.")
+
+    return {"fields": fields, "frame_idx": frame_idx, "date_idx": 9, "time_idx": 10, "imei": imei}
 
 
-def send_packets(packets, ip, port, log):
+def build_updated_packet(parsed: dict) -> str:
+    """Stamps the current UTC time and bumps the frame counter by 1, then
+    re-signs the packet with a fresh checksum. Mutates parsed['fields'] in
+    place so the NEXT call picks up from where this one left off — the PC
+    script instead re-parsed a slice of the outgoing string after every
+    send, which is harder to follow and only worked by luck."""
+    fields = parsed["fields"]
+
+    now = datetime.now(timezone.utc)
+    fields[parsed["date_idx"]] = now.strftime("%d%m%Y")
+    fields[parsed["time_idx"]] = now.strftime("%H%M%S")
+
+    old_frame = fields[parsed["frame_idx"]]
+    frame_width = len(old_frame)
+    # FIX: the PC script wrapped the frame counter at a hardcoded 999999.
+    # This template's frame field is "0000" — 4 digits, max value 9999 — so
+    # the old wrap point would never trigger and the field would silently
+    # grow past its width. Derive the wrap point from the field's own width
+    # instead of assuming a fixed size.
+    max_frame = 10 ** frame_width - 1
+    new_frame_int = int(old_frame) + 1
+    if new_frame_int > max_frame:
+        new_frame_int = 0
+    fields[parsed["frame_idx"]] = str(new_frame_int).zfill(frame_width)
+
+    body = ",".join(fields[:-1]) + ","
+    fields[-1] = compute_checksum(body)
+
+    return "$" + ",".join(fields) + "*\r\n"
+
+
+# ───────────────────────────────────────────
+#  TCP SENDING — single socket, all devices multiplexed onto it, same idea
+#  as your PC script, but reconnect/backoff now checks a stop_event instead
+#  of only reacting to Ctrl+C, so the Stop button can interrupt a retry.
+# ───────────────────────────────────────────
+
+class StoppedError(Exception):
+    """Raised internally to unwind out of a connect retry once Stop is pressed."""
+
+
+def make_socket(host, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(SOCKET_TIMEOUT)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    s.connect((host, port))
+    return s
+
+
+def ensure_connected(sock, host, port, stop_event, log_fn):
+    if sock is not None:
+        return sock
+    while not stop_event.is_set():
+        try:
+            log_fn(f"Connecting to {host}:{port} …")
+            s = make_socket(host, port)
+            log_fn("✓ Connected.")
+            return s
+        except Exception as exc:
+            log_fn(f"Connection failed: {exc} — retrying in {RECONNECT_DELAY}s")
+            stop_event.wait(RECONNECT_DELAY)
+    raise StoppedError()
+
+
+def send_loop(devices, stop_event, log_fn, token_check_fn, token_charge_fn):
+    """Runs until stop_event is set or tokens run out. One 'round' = one
+    packet sent for every device in `devices`; a token is charged per round,
+    matching how your original app charged per successful device send."""
+    sock = None
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
-        sock.connect((ip, port))
-    except OSError as e:
-        log(f"    ❌ Connect failed {ip}:{port} — {e}")
-        return False
-    try:
-        for pkt in packets:
-            sock.sendall((pkt["data"] + LINE_ENDING).encode('ascii'))
-            log(f"    📤 [{pkt['label']}] {pkt['data']}")
-            time.sleep(DELAY_BETWEEN_PACKETS)
+        while not stop_event.is_set():
+            if not token_check_fn():
+                log_fn("🚫 Out of tokens. Stopping.")
+                return
+            try:
+                sock = ensure_connected(sock, SERVER_IP, SERVER_PORT, stop_event, log_fn)
+            except StoppedError:
+                return
+
+            for d in devices:
+                if stop_event.is_set():
+                    return
+                packet = build_updated_packet(d["parsed"])
+                log_fn(f"[{d['imei']}] → {packet.strip()}")
+                try:
+                    sock.sendall(packet.encode("ascii"))
+                except Exception as exc:
+                    log_fn(f"[{d['imei']}] socket dropped ({exc}), reconnecting…")
+                    sock = None
+                    try:
+                        sock = ensure_connected(sock, SERVER_IP, SERVER_PORT, stop_event, log_fn)
+                    except StoppedError:
+                        return
+                    sock.sendall(packet.encode("ascii"))
+
+            token_charge_fn()
+            stop_event.wait(INTERVAL_SECONDS)
     finally:
-        sock.close()
-    return True
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 # ───────────────────────────────────────────
@@ -304,17 +367,17 @@ def send_packets(packets, ip, port, log):
 # ───────────────────────────────────────────
 
 class StyledButton(Button):
-    """A Button with rounded corners and our accent color instead of Kivy's default grey box."""
-    def __init__(self, **kw):
+    def __init__(self, color=ACCENT_COLOR, **kw):
         super().__init__(**kw)
         self.background_normal = ""
         self.background_down = ""
-        self.background_color = (0, 0, 0, 0)  # hide default flat background
+        self.background_color = (0, 0, 0, 0)
         self.color = (1, 1, 1, 1)
         self.font_size = 16
         self.bold = True
+        self._btn_color = color
         with self.canvas.before:
-            Color(*ACCENT_COLOR)
+            Color(*color)
             self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[10])
         self.bind(pos=self._update_rect, size=self._update_rect)
 
@@ -326,6 +389,17 @@ class StyledButton(Button):
 def styled_label(**kw):
     kw.setdefault("color", TEXT_COLOR)
     return Label(**kw)
+
+
+def styled_input(**kw):
+    kw.setdefault("multiline", False)
+    kw.setdefault("background_color", CARD_COLOR)
+    kw.setdefault("foreground_color", TEXT_COLOR)
+    kw.setdefault("cursor_color", TEXT_COLOR)
+    kw.setdefault("padding", [15, 12, 15, 12])
+    kw.setdefault("size_hint_y", None)
+    kw.setdefault("height", 44)
+    return TextInput(**kw)
 
 
 # ───────────────────────────────────────────
@@ -375,26 +449,43 @@ class LoginScreen(Screen):
 class MainScreen(Screen):
     def __init__(self, **kw):
         super().__init__(**kw)
-        self.devices = []
+        self.devices = []            # populated in bulk mode from Excel
         self.selected_path = None
-        root = BoxLayout(orientation="vertical", padding=15, spacing=12)
+        self.mode = "manual"         # "manual" or "bulk"
+        self.stop_event = threading.Event()
+        self.sending = False
 
-        self.token_label = styled_label(text="Tokens: -", font_size=16, bold=True, size_hint_y=0.06)
+        root = BoxLayout(orientation="vertical", padding=15, spacing=10)
+
+        self.token_label = styled_label(text="Tokens: -", font_size=16, bold=True, size_hint_y=0.05)
         root.add_widget(self.token_label)
 
-        self.file_label = styled_label(text="No file selected", size_hint_y=0.08,
-                                        color=(0.7, 0.7, 0.75, 1))
-        root.add_widget(self.file_label)
+        # Mode toggle
+        mode_row = BoxLayout(orientation="horizontal", size_hint_y=0.07, spacing=8)
+        self.manual_mode_btn = StyledButton(text="Manual Entry")
+        self.bulk_mode_btn = StyledButton(text="Bulk (Excel)", color=CARD_COLOR)
+        self.manual_mode_btn.bind(on_press=lambda *_: self.set_mode("manual"))
+        self.bulk_mode_btn.bind(on_press=lambda *_: self.set_mode("bulk"))
+        mode_row.add_widget(self.manual_mode_btn)
+        mode_row.add_widget(self.bulk_mode_btn)
+        root.add_widget(mode_row)
 
-        pick_btn = StyledButton(text="Select Excel File", size_hint_y=0.09)
-        pick_btn.bind(on_press=self.pick_excel)
-        root.add_widget(pick_btn)
+        # Container that gets swapped between manual fields and the Excel picker
+        self.input_area = BoxLayout(orientation="vertical", size_hint_y=0.38, spacing=8)
+        root.add_widget(self.input_area)
 
-        self.send_btn = StyledButton(text="Send All Devices", size_hint_y=0.09)
-        self.send_btn.bind(on_press=self.send_all)
-        root.add_widget(self.send_btn)
+        # Start / Stop
+        action_row = BoxLayout(orientation="horizontal", size_hint_y=0.09, spacing=8)
+        self.start_btn = StyledButton(text="Start Sending")
+        self.stop_btn = StyledButton(text="Stop", color=DANGER_COLOR)
+        self.stop_btn.disabled = True
+        self.start_btn.bind(on_press=self.start_sending)
+        self.stop_btn.bind(on_press=self.stop_sending)
+        action_row.add_widget(self.start_btn)
+        action_row.add_widget(self.stop_btn)
+        root.add_widget(action_row)
 
-        scroll = ScrollView(size_hint_y=0.68)
+        scroll = ScrollView(size_hint_y=0.41)
         self.log_label = styled_label(text="", size_hint_y=None, halign="left", valign="top")
         self.log_label.bind(texture_size=lambda *_: setattr(self.log_label, "height", self.log_label.texture_size[1]))
         self.log_label.text_size = (self.log_label.width, None)
@@ -402,6 +493,60 @@ class MainScreen(Screen):
         root.add_widget(scroll)
 
         self.add_widget(root)
+        self._build_manual_fields()
+        self.set_mode("manual")
+
+    # ---- mode switching ----
+
+    def _build_manual_fields(self):
+        self.manual_box = BoxLayout(orientation="vertical", spacing=6)
+        self.imei_input = styled_input(hint_text="IMEI")
+        self.vehicle_input = styled_input(hint_text="Vehicle Number")
+
+        lat_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=44, spacing=6)
+        self.lat_input = styled_input(hint_text="Latitude e.g. 026.485982")
+        self.latdir_input = styled_input(hint_text="N/S", size_hint_x=0.25)
+        lat_row.add_widget(self.lat_input)
+        lat_row.add_widget(self.latdir_input)
+
+        lon_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=44, spacing=6)
+        self.lon_input = styled_input(hint_text="Longitude e.g. 073.772890")
+        self.londir_input = styled_input(hint_text="E/W", size_hint_x=0.25)
+        lon_row.add_widget(self.lon_input)
+        lon_row.add_widget(self.londir_input)
+
+        for w in (self.imei_input, self.vehicle_input, lat_row, lon_row):
+            self.manual_box.add_widget(w)
+
+        self.bulk_box = BoxLayout(orientation="vertical", spacing=8)
+        self.file_label = styled_label(text="No file selected", size_hint_y=None, height=30,
+                                        color=(0.7, 0.7, 0.75, 1))
+        pick_btn = StyledButton(text="Select Excel File", size_hint_y=None, height=44)
+        pick_btn.bind(on_press=self.pick_excel)
+        self.bulk_box.add_widget(self.file_label)
+        self.bulk_box.add_widget(pick_btn)
+
+    def set_mode(self, mode):
+        if self.sending:
+            self.log("⚠️ Stop the current run before switching modes.")
+            return
+        self.mode = mode
+        self.input_area.clear_widgets()
+        if mode == "manual":
+            self.input_area.add_widget(self.manual_box)
+            self.manual_mode_btn._btn_color = ACCENT_COLOR
+            self.bulk_mode_btn._btn_color = CARD_COLOR
+        else:
+            self.input_area.add_widget(self.bulk_box)
+            self.manual_mode_btn._btn_color = CARD_COLOR
+            self.bulk_mode_btn._btn_color = ACCENT_COLOR
+        # repaint the toggle buttons to reflect which one is active
+        for btn in (self.manual_mode_btn, self.bulk_mode_btn):
+            btn.canvas.before.clear()
+            with btn.canvas.before:
+                Color(*btn._btn_color)
+                btn._rect = RoundedRectangle(pos=btn.pos, size=btn.size, radius=[10])
+            btn.bind(pos=btn._update_rect, size=btn._update_rect)
 
     def on_pre_enter(self):
         self.token_label.text = f"Tokens remaining: {App.get_running_app().tokens}"
@@ -411,17 +556,15 @@ class MainScreen(Screen):
             self.log_label.text += msg + "\n"
         Clock.schedule_once(_upd)
 
+    # ---- excel (bulk mode) ----
+
     def pick_excel(self, *_):
-        """Opens Android's own system file picker instead of drawing our own file browser.
-        This needs no storage permission at all — Android hands us the file directly."""
         try:
             android_pick_file(self._on_file_picked)
         except Exception as e:
             self.log(f"❌ Could not open file picker: {e}")
 
     def _on_file_picked(self, local_path, error):
-        # android_pick_file's callback can fire off the UI thread — hop back on it
-        # before touching any widgets or doing file I/O that updates the UI.
         def _load(dt):
             if error:
                 self.log(f"❌ {error}")
@@ -441,53 +584,79 @@ class MainScreen(Screen):
                 self.log(f"❌ Failed to read Excel: {e}")
         Clock.schedule_once(_load)
 
-    def send_all(self, *_):
-        if not self.devices:
-            self.log("❌ Load an Excel file first.")
+    # ---- start / stop ----
+
+    def start_sending(self, *_):
+        if self.sending:
             return
-        threading.Thread(target=self._send_thread, daemon=True).start()
 
-    def _send_thread(self):
+        if self.mode == "bulk":
+            if not self.devices:
+                self.log("❌ Load an Excel file first.")
+                return
+            raw_devices = self.devices
+        else:
+            imei = self.imei_input.text.strip()
+            vehicle = self.vehicle_input.text.strip()
+            lat = self.lat_input.text.strip()
+            lon = self.lon_input.text.strip()
+            if not all([imei, vehicle, lat, lon]):
+                self.log("❌ Fill in IMEI, Vehicle, Latitude and Longitude first.")
+                return
+            raw_devices = [{
+                "imei": imei, "vehicle_no": vehicle,
+                "latitude": lat, "lat_dir": (self.latdir_input.text.strip().upper() or "N"),
+                "longitude": lon, "lon_dir": (self.londir_input.text.strip().upper() or "E"),
+            }]
+
+        prepared = []
+        for dv in raw_devices:
+            raw = build_raw_template(dv["imei"], dv["vehicle_no"], dv["latitude"],
+                                      dv["lat_dir"], dv["longitude"], dv["lon_dir"])
+            try:
+                prepared.append({"imei": dv["imei"], "parsed": parse_packet(raw, dv["imei"])})
+            except Exception as e:
+                self.log(f"❌ Skipping {dv['imei']}: {e}")
+
+        if not prepared:
+            self.log("❌ No valid devices to send.")
+            return
+
+        self.stop_event = threading.Event()
+        self.sending = True
+        self.start_btn.disabled = True
+        self.stop_btn.disabled = False
+        self.log(f"\n▶️ Sending for {len(prepared)} device(s) every {INTERVAL_SECONDS}s. Press Stop to end.")
+        threading.Thread(target=self._send_thread, args=(prepared,), daemon=True).start()
+
+    def stop_sending(self, *_):
+        if not self.sending:
+            return
+        self.stop_event.set()
+        self.log("⏹ Stop requested — finishing current step...")
+
+    def _send_thread(self, prepared):
         app = App.get_running_app()
-        base_f = parse_nrm(BASE_NRM)
 
-        for idx, dev in enumerate(self.devices, 1):
-            # Refresh + check token balance BEFORE each send
+        def token_check():
             app.tokens = get_tokens(app.uid, app.id_token)
-            if app.tokens <= 0:
-                self.log("🚫 Out of tokens. Contact admin to top up your account.")
-                break
+            return app.tokens > 0
 
-            now = datetime.now(timezone.utc)
-            f = dict(base_f)
-            f.update({
-                "imei": dev["imei"], "vehicle_no": dev["vehicle_no"],
-                "latitude": dev["latitude"], "lat_dir": dev["lat_dir"],
-                "longitude": dev["longitude"], "lon_dir": dev["lon_dir"],
-                "date": now.strftime("%d%m%Y"), "time": now.strftime("%H%M%S"),
-            })
+        def token_charge():
+            app.tokens = decrement_token(app.uid, app.id_token, app.tokens)
+            new_total = app.tokens
+            Clock.schedule_once(lambda dt: setattr(self.token_label, "text", f"Tokens remaining: {new_total}"))
+            self.log(f"   1 token used this round. Remaining: {new_total}")
 
-            self.log(f"\n📱 Device {idx}/{len(self.devices)} — {dev['imei']}")
-            ok_main = send_packets(
-                [{"label": "LGN", "data": gen_lgn(f)},
-                 {"label": "HEL", "data": gen_hel(f)},
-                 {"label": "PVT", "data": gen_pvt(f)}],
-                SERVER_IP, SERVER_PORT, self.log)
-            ok_emr = send_packets(
-                [{"label": "EMR", "data": gen_epb(f, "EMR")},
-                 {"label": "SEM", "data": gen_epb(f, "SEM")}],
-                EMERGENCY_IP, EMERGENCY_PORT, self.log)
+        send_loop(prepared, self.stop_event, self.log, token_check, token_charge)
 
-            if ok_main and ok_emr:
-                app.tokens = decrement_token(app.uid, app.id_token, app.tokens)
-                self.log(f"   ✅ 1 token used. Remaining: {app.tokens}")
-                Clock.schedule_once(lambda dt: setattr(self.token_label, "text", f"Tokens remaining: {app.tokens}"))
-            else:
-                self.log("   ❌ Send failed — token not charged.")
+        self.log("⏹ Stopped by user." if self.stop_event.is_set() else "✅ Done (out of tokens).")
+        self.sending = False
+        Clock.schedule_once(lambda dt: self._reset_buttons())
 
-            time.sleep(DELAY_BETWEEN_DEVICES)
-
-        self.log("\n✅ Done.")
+    def _reset_buttons(self):
+        self.start_btn.disabled = False
+        self.stop_btn.disabled = True
 
 
 class AIS140App(App):
