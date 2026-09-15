@@ -43,7 +43,7 @@ except ImportError:
 FIREBASE_API_KEY = "AIzaSyATiCDMs5w-RAKZKIB9tIvx27Hb3uruU48"
 FIREBASE_PROJECT = "up-data-push"
 
-SERVER_IP, SERVER_PORT = "127.0.0.1", 7001
+SERVER_IP, SERVER_PORT = "minesdata.rajasthan.gov.in", 7001
 # ══════════════════════════════════════════════════════════
 
 INTERVAL_SECONDS = 10     # how often a full round of packets goes out, same knob as the PC script
