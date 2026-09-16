@@ -321,9 +321,13 @@ def send_loop(devices, stop_event, log_fn, token_check_fn, token_charge_fn):
                 if stop_event.is_set():
                     return
                 packet = build_updated_packet(d["parsed"])
-                log_fn(f"[{d['imei']}] → {packet.strip()}")
+                # Only report that a packet went out — not its raw contents.
+                # (Previously this logged the full field-by-field packet
+                # string, which is only useful for protocol debugging and
+                # just clutters the log during normal use.)
                 try:
                     sock.sendall(packet.encode("ascii"))
+                    log_fn(f"[{d['imei']}] ✅ Sent 1 packet")
                 except Exception as exc:
                     log_fn(f"[{d['imei']}] socket dropped ({exc}), reconnecting…")
                     sock = None
@@ -332,6 +336,7 @@ def send_loop(devices, stop_event, log_fn, token_check_fn, token_charge_fn):
                     except StoppedError:
                         return
                     sock.sendall(packet.encode("ascii"))
+                    log_fn(f"[{d['imei']}] ✅ Sent 1 packet")
 
             token_charge_fn()
             stop_event.wait(INTERVAL_SECONDS)
@@ -406,7 +411,17 @@ class StyledButton(Button):
 
 
 class OutlinedInput(TextInput):
-    """Clean outlined input with active indigo focus ring."""
+    """Clean outlined input with active indigo focus ring.
+
+    FIX: the previous version left font_size at Kivy's default (~15sp) with
+    16px of padding on each side. For a long value like a 15-digit IMEI or
+    a "026.485982" coordinate inside a half-width GridLayout column, that
+    left barely enough room to show half the characters — the rest was
+    still there, just scrolled out of view, which is why it looked "cut
+    off" rather than wrapped. Two independent fixes: give the widget more
+    height/padding room, and stop cramming these into half-width columns
+    (see MainScreen._build_subviews below).
+    """
     def __init__(self, **kw):
         kw.setdefault("multiline", False)
         kw.setdefault("background_normal", "")
@@ -415,9 +430,10 @@ class OutlinedInput(TextInput):
         kw.setdefault("foreground_color", TEXT_COLOR)
         kw.setdefault("hint_text_color", TEXT_MUTED)
         kw.setdefault("cursor_color", ACCENT_COLOR)
-        kw.setdefault("padding", [16, 12, 16, 12])
+        kw.setdefault("font_size", 16)
+        kw.setdefault("padding", [14, 14, 14, 14])
         kw.setdefault("size_hint_y", None)
-        kw.setdefault("height", 48)
+        kw.setdefault("height", 52)
         super().__init__(**kw)
 
         with self.canvas.before:
@@ -731,7 +747,11 @@ class MainScreen(Screen):
         root.add_widget(mode_card)
 
         # INPUT AREA CONTAINER
-        self.input_container = BoxLayout(orientation="vertical", size_hint_y=None, height=220)
+        # FIX: was a fixed height of 220, sized for the old 2-column grid.
+        # The new stacked, full-width layout (see _build_subviews) needs
+        # more vertical room — 4 full-width rows instead of 2 grid rows —
+        # so this grows to 300.
+        self.input_container = BoxLayout(orientation="vertical", size_hint_y=None, height=300)
         root.add_widget(self.input_container)
 
         # ACTION BUTTONS ROW (Start & Stop)
@@ -771,31 +791,44 @@ class MainScreen(Screen):
 
     def _build_subviews(self):
         # Manual Form View
-        self.manual_box = GridLayout(cols=2, spacing=10, size_hint_y=None, height=220)
+        # FIX: this used to be GridLayout(cols=2), which put IMEI next to
+        # Vehicle and Lat next to Lon — each field only got ~50% of the
+        # screen width. A 15-digit IMEI or a "026.485982" coordinate at
+        # font_size 16 doesn't fit in that width, so half the text sat
+        # scrolled off-screen inside the box (not actually cut off — just
+        # not visible). Stacking IMEI and Vehicle as their own full-width
+        # rows fixes that; Lat/Lon keep a small side-by-side field only for
+        # their short N/S, E/W direction letter, which does fit fine at
+        # that width.
+        self.manual_box = BoxLayout(orientation="vertical", spacing=10, size_hint_y=None, height=300)
+
         self.imei_input = OutlinedInput(hint_text="IMEI Number")
         self.imei_input.text = "864501049283719"
+
         self.veh_input = OutlinedInput(hint_text="Vehicle Reg No.")
         self.veh_input.text = "RJ14-GB-9921"
 
-        self.lat_input = OutlinedInput(hint_text="Lat e.g. 026.485982")
+        lat_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=52, spacing=8)
+        self.lat_input = OutlinedInput(hint_text="Lat e.g. 026.485982", size_hint_x=0.72)
         self.lat_input.text = "026.485982"
-        self.latdir_input = OutlinedInput(hint_text="N/S")
+        self.latdir_input = OutlinedInput(hint_text="N/S", size_hint_x=0.28)
         self.latdir_input.text = "N"
+        lat_row.add_widget(self.lat_input)
+        lat_row.add_widget(self.latdir_input)
 
-        self.lon_input = OutlinedInput(hint_text="Lon e.g. 073.772890")
+        lon_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=52, spacing=8)
+        self.lon_input = OutlinedInput(hint_text="Lon e.g. 073.772890", size_hint_x=0.72)
         self.lon_input.text = "073.772890"
-        self.londir_input = OutlinedInput(hint_text="E/W")
+        self.londir_input = OutlinedInput(hint_text="E/W", size_hint_x=0.28)
         self.londir_input.text = "E"
+        lon_row.add_widget(self.lon_input)
+        lon_row.add_widget(self.londir_input)
 
-        self.manual_box.add_widget(self.imei_input)
-        self.manual_box.add_widget(self.veh_input)
-        self.manual_box.add_widget(self.lat_input)
-        self.manual_box.add_widget(self.latdir_input)
-        self.manual_box.add_widget(self.lon_input)
-        self.manual_box.add_widget(self.londir_input)
+        for w in (self.imei_input, self.veh_input, lat_row, lon_row):
+            self.manual_box.add_widget(w)
 
         # Bulk Excel View
-        self.bulk_box = CardBox(orientation="vertical", padding=20, spacing=12, size_hint_y=None, height=220)
+        self.bulk_box = CardBox(orientation="vertical", padding=20, spacing=12, size_hint_y=None, height=300)
         self.file_lbl = Label(text="No Excel file selected", font_size=13, color=TEXT_MUTED)
         pick_btn = StyledButton(text="📁  Select Excel File (.xlsx)", bg_color=INPUT_BG, hover_color=BORDER_COLOR)
         pick_btn.bind(on_press=self.pick_excel)
